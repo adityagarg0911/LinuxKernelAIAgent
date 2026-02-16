@@ -1,0 +1,11 @@
+{
+    "chat.mcp.serverSampling": {
+        "LinuxKernelDebugAgent/.vscode/mcp.json: ssh": {
+            "allowedModels": [
+                "copilot/claude-opus-41",
+                "copilot/gemini-2.5-pro",
+                "copilot/gpt-5"
+            ]
+        }
+    }
+}
