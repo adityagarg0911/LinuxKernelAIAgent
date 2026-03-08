@@ -1,14 +1,43 @@
-"""MCP SSH Server - Refactored main entry point."""
-from typing import Optional, Literal
+"""MCP SSH Server — Linux kernel development automation over SSH.
+
+Exposes a set of MCP tools for:
+- Managing SSH connections (connect, close, list, check, exec)
+- Kernel development (clone, patch, build, install, reboot)
+- Crash analysis (dmesg tail, crash-directory inspection)
+- Diagnostics (kernel version, ethtool stats)
+- Automated bisection (compile regression)
+
+Each tool returns a plain dict.  Connection-aware tools look up
+an existing ``connection_id``; if it is unknown they return a
+``NotFound`` error — callers should reconnect.
+"""
+
+from __future__ import annotations
+
+from typing import Literal, Optional
+
 from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
 
-import connection_manager
-import kernel_tools
-import crash_analysis
-import git_operations
-import diagnostics
+from . import connection_manager
+from . import kernel_tools
+from . import crash_analysis
+from . import git_operations
+from . import diagnostics
+from ._helpers import not_found_result, DEFAULT_REPO_PATH, DEFAULT_PATCH_FILENAME
 
 mcp = FastMCP("SSH")
+
+# ── Shared helper used by nearly every tool ──────────────────────
+
+def _client_or_error(connection_id: str):
+    """Return ``(client, None)`` or ``(None, error_dict)``."""
+    client = connection_manager.get_connection(connection_id)
+    if client is None:
+        return None, not_found_result(connection_id)
+    return client, None
+
+
+# ── Connection management ────────────────────────────────────────
 
 
 @mcp.tool()
@@ -22,30 +51,68 @@ def ssh_connect(
     timeout_seconds: int = 30,
     accept_unknown_host: bool = True,
 ) -> dict:
-    """Establish and cache a persistent SSH connection.
+    """Establish and cache a persistent SSH connection to a remote VM.
 
-    NOTE: Do NOT invoke unless the user explicitly requests a new
-    connection (reuse existing connection_id when possible).
-    Provide exactly one of password or private_key. Returns a
-    connection_id you can use with ssh_exec/ssh_close.
-    Dont call any extra function after this unless explicitly
-    requested by the user.
+    WHEN TO USE: User says "connect to", "SSH into", "log in to", or
+    provides a host/IP and credentials.
+    WHEN NOT TO USE: A connection_id already exists and is alive — reuse
+    it instead.  Call check_connection first if unsure.
+
+    IMPORTANT:
+      - Provide exactly ONE of password or private_key (not both, not neither).
+      - After this returns, do NOT call any other tool unless the user
+        explicitly asks.  Just report the connection_id.
+      - The returned connection_id must be passed to every subsequent
+        tool that requires one.
+
+    Args:
+      host: IP address or hostname of the remote VM.
+      username: SSH username (e.g. "root", "azureuser").
+      port: SSH port (default 22).
+      password: Plaintext password (mutually exclusive with private_key).
+      private_key: PEM-encoded private key string (mutually exclusive with password).
+      passphrase: Passphrase for an encrypted private_key (optional).
+      timeout_seconds: Connection timeout in seconds.
+      accept_unknown_host: If True, auto-accept unknown host keys.
+
+    Returns:
+      connection_id, host, port, username, connect_ms on success.
+      error, type on failure.
     """
     return connection_manager.ssh_connect_impl(
         host, username, port, password, private_key,
-        passphrase, timeout_seconds, accept_unknown_host
+        passphrase, timeout_seconds, accept_unknown_host,
     )
 
 
 @mcp.tool()
 def ssh_close(connection_id: str) -> dict:
-    """Close a previously established SSH connection."""
+    """Close a previously established SSH connection and free resources.
+
+    WHEN TO USE: User says "disconnect", "close connection", or you need
+    to reconnect after a failed check_connection.
+    Always close before re-connecting to the same host.
+
+    Args:
+      connection_id: The UUID returned by ssh_connect.
+
+    Returns:
+      closed: True on success.
+    """
     return connection_manager.ssh_close_impl(connection_id)
 
 
 @mcp.tool()
 def ssh_list() -> dict:
-    """List active SSH connection IDs."""
+    """List all active SSH connections with metadata (host, port, user, time).
+
+    WHEN TO USE: User asks "which connections are open", "list sessions",
+    or you need to find an existing connection_id to reuse.
+    No parameters required.
+
+    Returns:
+      connections: list of {connection_id, host, port, username, connected_at}.
+    """
     return connection_manager.ssh_list_impl()
 
 
@@ -56,21 +123,32 @@ def ssh_exec(
     timeout_seconds: int = 30,
     output_encoding: Literal["utf-8", "latin-1"] = "utf-8",
 ) -> dict:
-    """
-    Execute any shell command over an existing SSH connection.
+    """Execute an arbitrary shell command on the remote VM over SSH.
 
-    Use this tool for generic shell commands that do not have a
-    dedicated MCP tool.
-    For example, do NOT use this for applying patches to the Linux
-    kernel source trees—use git_apply_patch_file instead and
-    cloning Linux kernel source trees—use clone_linux_subsystem_tree
-    instead, editing source files.
+    WHEN TO USE: For generic commands that do NOT have a dedicated tool
+    (e.g. ls, cat, grep, systemctl, ip addr, etc.).
+    WHEN NOT TO USE — prefer these specialised tools instead:
+      - Applying patches     → git_apply_patch_file
+      - Cloning kernel repos → clone_linux_source_tree
+      - Building the kernel  → build_kernel_from_source
+      - Checking kernel logs → analyze_dmesg_tail
+      - NIC statistics       → get_ethtool_stats
+      - Kernel version       → kernel_version
+
+    Args:
+      connection_id: Active connection UUID from ssh_connect.
+      command: The exact shell command string to execute.
+      timeout_seconds: Max seconds to wait for the command to finish.
+      output_encoding: Decode stdout/stderr as "utf-8" (default) or "latin-1".
+
+    Returns:
+      stdout, stderr, exit_code, duration_ms.
     """
-    client = connection_manager.get_connection(connection_id)
-    if client is None:
-        return {"error": "Unknown connection_id", "type": "NotFound"}
+    client, err = _client_or_error(connection_id)
+    if err:
+        return err
     return diagnostics.ssh_exec_impl(
-        client, command, timeout_seconds, output_encoding
+        client, command, timeout_seconds, output_encoding,
     )
 
 
@@ -79,26 +157,28 @@ def check_connection(
     connection_id: str,
     timeout_seconds: int = 5,
 ) -> dict:
-    """SSH connection liveness check (exec probe only).
+    """Check whether an SSH connection is still alive and responsive.
 
-    Always runs a minimal remote command `echo OK` to verify a full
-    round-trip (transport + channel + command execution) and measures
-    latency. Use this after any failing operation to confirm whether the
-    remote VM / kernel is still responsive.
-    If the connection is not alive, do ssh_close and ssh_connect again.
+    WHEN TO USE: After any tool returns an error or timeout, or when
+    the user asks "is the connection alive?", "check connection",
+    "is the VM up?".
+    RECOVERY: If alive=False, call ssh_close then ssh_connect to
+    re-establish the session.
+
+    Runs a minimal ``echo OK`` round-trip and measures latency.
+
+    Args:
+      connection_id: Active connection UUID from ssh_connect.
+      timeout_seconds: Max seconds for the probe command.
 
     Returns:
-      - alive: bool
-      - transport_active: bool
-      - latency_ms: int | None
-      - stdout / stderr / exit_code
-      - reason (when not alive): exec-failed | transport-inactive |
-        exec-exception
-      - error / type (if exception)
+      alive (bool), transport_active (bool), latency_ms (int|null),
+      stdout, stderr, exit_code,
+      reason (str|null — "exec-failed" | "transport-inactive" | "exec-exception").
     """
-    client = connection_manager.get_connection(connection_id)
-    if client is None:
-        return {"error": "Unknown connection_id", "type": "NotFound"}
+    client, err = _client_or_error(connection_id)
+    if err:
+        return err
     return diagnostics.check_connection_impl(client, timeout_seconds)
 
 
@@ -107,14 +187,25 @@ def kernel_version(
     connection_id: str,
     timeout_seconds: int = 5,
 ) -> dict:
-    """Retrieve the remote kernel version using `uname -rs`.
+    """Retrieve the running kernel version on the remote VM.
 
-    TRIGGER KEYWORDS: kernel version | uname -r | uname -rs | check kernel
-    Returns both the raw output and parsed fields.
+    WHEN TO USE: User says "kernel version", "uname", "what kernel",
+    "check kernel", or you need to verify which kernel booted after
+    a build/reboot cycle.
+
+    Runs ``uname -rs`` and parses the output.
+
+    Args:
+      connection_id: Active connection UUID.
+      timeout_seconds: Max seconds to wait.
+
+    Returns:
+      stdout (raw output), exit_code, kernel_name (e.g. "Linux"),
+      release (e.g. "6.8.0-rc1+").
     """
-    client = connection_manager.get_connection(connection_id)
-    if client is None:
-        return {"error": "Unknown connection_id", "type": "NotFound"}
+    client, err = _client_or_error(connection_id)
+    if err:
+        return err
     return diagnostics.kernel_version_impl(client, timeout_seconds)
 
 
@@ -124,13 +215,27 @@ def install_developer_tools(
     sudo_password: Optional[str] = None,
     timeout_seconds: int = 120,
 ) -> dict:
-    """Install basic developer tools on the remote VM using
-    sudo apt-get install. Optionally provide sudo_password."""
-    client = connection_manager.get_connection(connection_id)
-    if client is None:
-        return {"error": "Unknown connection_id", "type": "NotFound"}
+    """Install Linux kernel development packages on the remote VM.
+
+    WHEN TO USE: User says "install dev tools", "install build deps",
+    "setup build environment", or before a first kernel build.
+    Installs: build-essential, libncurses-dev, bison, flex, libssl-dev,
+    libelf-dev, libdw-dev, ssh, git, vim, net-tools, zstd, universal-ctags.
+
+    Args:
+      connection_id: Active connection UUID.
+      sudo_password: Required if the remote user needs sudo with a password.
+        Pass the same password used for ssh_connect if applicable.
+      timeout_seconds: Max seconds for apt operations.
+
+    Returns:
+      stdout, stderr, exit_code, duration_ms, command.
+    """
+    client, err = _client_or_error(connection_id)
+    if err:
+        return err
     return kernel_tools.install_developer_tools_impl(
-        client, sudo_password, timeout_seconds
+        client, sudo_password, timeout_seconds,
     )
 
 
@@ -140,19 +245,29 @@ def sftp_patch_file(
     local_path: str,
     remote_path: Optional[str] = None,
 ) -> dict:
-    """
-    Upload a local .patch file (from the machine running this MCP server)
-    to the remote VM via SFTP.
+    """Upload a local .patch file from the MCP server host to the remote VM via SFTP.
 
-    - If remote_path is omitted, it defaults to:
-      ~/repos/net-next/debugAgent.patch
-    - If remote_path ends with '/', the file will be uploaded with the
-      same basename into that directory.
+    WHEN TO USE: User says "upload patch", "transfer patch", "send patch
+    to VM", or before calling git_apply_patch_file.
+    WORKFLOW: sftp_patch_file → git_apply_patch_file → build_kernel_from_source.
+
+    Args:
+      connection_id: Active connection UUID.
+      local_path: Absolute path to the .patch file on the local machine
+        (the machine running this MCP server).
+      remote_path: Destination path on the VM. Defaults to
+        ~/repos/net-next/debugAgent.patch. If it ends with "/", the
+        local filename is appended automatically.
+
+    Returns:
+      ok (bool), local_path, remote_path, bytes, duration_ms.
     """
-    client = connection_manager.get_connection(connection_id)
-    if client is None:
-        return {"error": "Unknown connection_id", "type": "NotFound"}
-    return git_operations.sftp_patch_file_impl(client, local_path, remote_path)
+    client, err = _client_or_error(connection_id)
+    if err:
+        return err
+    return git_operations.sftp_patch_file_impl(
+        client, local_path, remote_path,
+    )
 
 
 @mcp.tool()
@@ -162,26 +277,36 @@ def git_apply_patch_file(
     patch_path: str = "~/repos/net-next/debugAgent.patch",
     timeout_seconds: int = 600,
 ) -> dict:
-    """Apply patch to kernel repo (net-next by default).
+    """Apply a .patch file to a Linux kernel git repo on the remote VM.
 
-    TRIGGER KEYWORDS: apply patch | apply git patch | git am |
-    git apply | apply debugAgent.patch | apply diff
+    WHEN TO USE: User says "apply patch", "apply diff", "git am",
+    "git apply", or after uploading a patch with sftp_patch_file.
+    WHEN NOT TO USE: Do NOT use ssh_exec for this — always use this tool.
 
-    Simple logic:
-        - cd repo (default: ~/repos/net-next)
-        - mailbox patch? (first line 'From <40hex> ') => git am -3 patch
-        - else => git apply patch && git commit -a -m
-          "Apply patch: <filename>"
+    Auto-detects mailbox-format patches (lines starting with
+    ``From <40hex>``) and uses ``git am -3``; otherwise uses
+    ``git apply`` followed by an explicit ``git commit``.
 
-    Use this instead of generic ssh_exec when user asks to apply a patch.
-    Parameters: connection_id, repo_path?, patch_path?
-    Returns: exit_code, stdout, stderr, repo_path, patch_path.
+    TYPICAL WORKFLOW:
+      1. sftp_patch_file (upload the .patch)
+      2. git_apply_patch_file (this tool — apply it)
+      3. build_kernel_from_source (compile & install)
+
+    Args:
+      connection_id: Active connection UUID.
+      repo_path: Path to the kernel repo on the VM (default: ~/repos/net-next).
+      patch_path: Path to the .patch file on the VM
+        (default: ~/repos/net-next/debugAgent.patch).
+      timeout_seconds: Max seconds for the apply operation.
+
+    Returns:
+      exit_code, stdout, stderr, duration_ms, repo_path, patch_path.
     """
-    client = connection_manager.get_connection(connection_id)
-    if client is None:
-        return {"error": "Unknown connection_id", "type": "NotFound"}
+    client, err = _client_or_error(connection_id)
+    if err:
+        return err
     return git_operations.git_apply_patch_file_impl(
-        client, repo_path, patch_path, timeout_seconds
+        client, repo_path, patch_path, timeout_seconds,
     )
 
 
@@ -193,30 +318,33 @@ def clone_linux_source_tree(
     branch: Optional[str] = None,
     timeout_seconds: int = 1200,
 ) -> dict:
-    """
-    Clone a Linux kernel source tree in the VM using the active SSH
-    connection.
+    """Clone a Linux kernel source tree on the remote VM.
 
-    Use this tool when the user asks to clone a Linux kernel source tree
-    (e.g., net-next or any other kernel repo).
-    By default, this tool clones the net-next tree (mainline networking
-    development) into ~/repos/net-next.
-    If the user provides a specific git_url, that repository will be
-    cloned instead, into ~/repos/{repo-name} unless a custom
-    destination_path is given.
+    WHEN TO USE: User says "clone net-next", "clone kernel source",
+    "clone linux tree", "git clone kernel", or when the repo doesn't
+    exist yet on the VM.
+    WHEN NOT TO USE: Do NOT use ssh_exec for cloning — always use this tool.
 
-    When to invoke:
-    - Use this tool for requests like "clone net-next", "clone kernel
-      source", "clone linux tree", etc.
-    - If no git_url is specified, the net-next tree will be cloned by
-      default.
-    - If you want a different tree, provide the git_url explicitly.
+    Defaults to cloning the net-next tree (mainline networking development)
+    into ~/repos/net-next. Supply git_url for any other kernel repo.
+
+    Args:
+      connection_id: Active connection UUID.
+      git_url: Full git URL. Defaults to the net-next tree at
+        git.kernel.org if omitted.
+      destination_path: Where to clone on the VM. Defaults to
+        ~/repos/{repo-name} derived from the URL.
+      branch: Specific branch to clone (optional).
+      timeout_seconds: Max seconds (default 1200 = 20 min for large repos).
+
+    Returns:
+      exit_code, stdout, stderr, duration_ms, command, destination_path.
     """
-    client = connection_manager.get_connection(connection_id)
-    if client is None:
-        return {"error": "Unknown connection_id", "type": "NotFound"}
+    client, err = _client_or_error(connection_id)
+    if err:
+        return err
     return git_operations.clone_linux_source_tree_impl(
-        client, git_url, destination_path, branch, timeout_seconds
+        client, git_url, destination_path, branch, timeout_seconds,
     )
 
 
@@ -229,42 +357,45 @@ def build_kernel_from_source(
     jobs: int = 0,
     timeout_seconds: int = 7200,
 ) -> dict:
-    """Build and install the kernel from the repo root (no reboot).
-    If the build fails or code fixes are needed, do NOT edit files
-    on the VM; instead: use git_reset_last_commit, edit the LOCAL patch
-    (local_patch_edit), re-upload it with sftp_patch_file, re-apply
-    with git_apply_patch_file, then run this tool again.
+    """Build and install the Linux kernel from source on the remote VM (NO reboot).
 
-    Sequence:
-      1. cp /boot/config-$(uname -r) .config
-      2. make olddefconfig
-      3. yes "" | make localmodconfig
-      4. scripts/config --disable SYSTEM_TRUSTED_KEYS
-      5. scripts/config --disable SYSTEM_REVOCATION_KEYS
-      6. scripts/config --disable MODULE_SIG
-      7. scripts/config --disable MODULE_SIG_ALL
-      8. scripts/config --disable MODULE_SIG_SHA512
-      9. scripts/config --undefine MODULE_SIG_KEY
-     10. make olddefconfig
-     11. sudo make -j$(nproc)   (or -j<jobs> if jobs>0)
-     12. sudo make headers_install
-     13. sudo make -j$(nproc) modules_install
-     14. sudo make -j$(nproc) install
-     15. sudo update-grub (fallback to update-grub2)
+    WHEN TO USE: User says "build kernel", "compile kernel", "make kernel",
+    "install kernel", or after applying a patch.
+    WHEN NOT TO USE: Do NOT use ssh_exec with raw make commands — use this tool.
 
-    Notes:
-      - Parameter install_deps is currently ignored (no package install).
-      - If /boot/config-$(uname -r) is missing the script aborts.
-      - No reboot is performed; use reboot_vm separately if needed.
+    Build sequence:
+      1. Copy /boot/config-$(uname -r) → .config
+      2. make olddefconfig → localmodconfig
+      3. Disable module signing (SYSTEM_TRUSTED_KEYS, MODULE_SIG, etc.)
+      4. make -j$(nproc) (or -j<jobs>)
+      5. Install: headers → modules → kernel → update-grub
+
+    ON BUILD FAILURE — do NOT edit files on the VM. Instead:
+      1. Fix the patch locally on the MCP server host.
+      2. Re-upload with sftp_patch_file.
+      3. Re-apply with git_apply_patch_file.
+      4. Re-run this tool.
+
+    After success, call reboot_vm to boot into the new kernel.
+
+    Args:
+      connection_id: Active connection UUID.
+      repo_path: Kernel repo path on VM (default: ~/repos/net-next).
+      sudo_password: Required for sudo operations during install.
+      install_deps: Currently unused (reserved for future).
+      jobs: Parallel make jobs (0 = auto-detect via nproc).
+      timeout_seconds: Max seconds (default 7200 = 2 hours).
+
     Returns:
-      - exit_code, stdout, stderr, log_path, kernelrelease
+      exit_code, stdout, stderr, duration_ms, repo_path,
+      log_path (on-VM build log), kernelrelease (e.g. "6.8.0-rc1+").
     """
-    client = connection_manager.get_connection(connection_id)
-    if client is None:
-        return {"error": "Unknown connection_id", "type": "NotFound"}
+    client, err = _client_or_error(connection_id)
+    if err:
+        return err
     return kernel_tools.build_kernel_from_source_impl(
         client, repo_path, sudo_password, install_deps,
-        jobs, timeout_seconds
+        jobs, timeout_seconds,
     )
 
 
@@ -276,16 +407,31 @@ def find_compile_regression(
     bad_commit: str = "HEAD",
     sudo_password: str = "",
 ) -> dict:
+    """Automated git-bisect to find which commit broke kernel compilation.
+
+    WHEN TO USE: User says "find compile regression", "bisect build failure",
+    "which commit broke the build", or when a kernel build fails and user
+    wants to identify the culprit commit.
+
+    Binary-searches between good_commit and bad_commit, testing compilation
+    at each step (up to 20 iterations).
+
+    Args:
+      connection_id: Active connection UUID.
+      repo_path: Kernel repo path (default: ~/repos/net-next).
+      good_commit: A known-good commit or tag (default: "v6.8").
+      bad_commit: A known-bad commit (default: "HEAD").
+      sudo_password: For sudo during compilation.
+
+    Returns:
+      success (bool), culprit_commit (short hash), culprit_full (full hash),
+      steps_taken, bisect_log (list of step dicts), summary, repo_path.
     """
-    Automated git bisect to find compilation regression in Linux kernel.
-    Uses binary search with robust compilation testing to find the exact
-    commit that broke the build.
-    """
-    client = connection_manager.get_connection(connection_id)
-    if client is None:
-        return {"error": "Unknown connection_id", "type": "NotFound"}
+    client, err = _client_or_error(connection_id)
+    if err:
+        return err
     return kernel_tools.find_compile_regression_impl(
-        client, good_commit, bad_commit, repo_path, sudo_password
+        client, good_commit, bad_commit, repo_path, sudo_password,
     )
 
 
@@ -296,46 +442,35 @@ def analyze_dmesg_tail(
     sudo_password: Optional[str] = None,
     timeout_seconds: int = 8,
 ) -> dict:
-    """Fetch and heuristically analyze the tail of dmesg for recent
-    problems.
+    """Fetch and heuristically analyze the last N lines of dmesg for kernel problems.
 
-    Parameters:
-      lines (int): How many lines from the end of dmesg to inspect
-        (default 100).
-      sudo_password (optional): If provided, will attempt `sudo dmesg`
-        if plain dmesg fails.
+    WHEN TO USE: User says "check dmesg", "kernel logs", "any crashes",
+    "analyze dmesg", "check for panics", or after a suspected crash/hang.
 
-    Heuristics:
-      Scans tail for common critical markers (case-insensitive where
-      relevant):
-        - panic
-        - oops
-        - BUG:
-        - WARNING:
-        - Call Trace:
-        - RIP: / CR2: (arch crash context)
-        - segfault
-        - soft lockup / hard lockup
-        - general protection fault
+    Scans for: kernel panic, oops, BUG:, WARNING:, Call Trace:,
+    segfault, soft/hard lockup, general protection fault.
+
+    After reviewing the results, provide a SHORT crash analysis to the
+    user covering: what happened, likely root cause, and mitigation steps.
+
+    Args:
+      connection_id: Active connection UUID.
+      lines: How many lines from the end of dmesg to inspect (default 100).
+      sudo_password: If provided, runs dmesg via sudo (often required on
+        non-root accounts).
+      timeout_seconds: Max seconds for the dmesg fetch.
 
     Returns:
-      - stdout / stderr / exit_code (from successful retrieval)
-      - lines_requested / lines_returned
-      - issues_detected (bool)
-      - indicators (counts dict)
-      - events (list of {kind, line_index, text})
-      - last_event (kind or None)
-      - raw_tail (the joined tail text)
-      - used_sudo (bool) whether sudo was used
-
-    LLM finally gives a crisp and short analysis of the crash, steps to
-    mitigate, update in patch if possible or needed.
+      issues_detected (bool), indicators (dict of counts per category),
+      events (list of {kind, line_index, text}), last_event (str|null),
+      raw_tail (full text), used_sudo (bool),
+      stdout, stderr, exit_code.
     """
-    client = connection_manager.get_connection(connection_id)
-    if client is None:
-        return {"error": "Unknown connection_id", "type": "NotFound"}
+    client, err = _client_or_error(connection_id)
+    if err:
+        return err
     return crash_analysis.analyze_dmesg_tail_impl(
-        client, lines, sudo_password, timeout_seconds
+        client, lines, sudo_password, timeout_seconds,
     )
 
 
@@ -347,81 +482,80 @@ def analyze_latest_crash_dmesg(
     max_bytes: int = 500_000,
     timeout_seconds: int = 20,
 ) -> dict:
-    """Locate the newest crash directory (/var/crash/YYYYMMDDHHMM) and
-    analyze its dmesg.<timestamp> file.
+    """Find the most recent crash directory and analyze its saved dmesg file.
 
-    Directory naming convention assumed: 12-digit UTC timestamp
-    YYYYMMDDHHMM.
-    We:
-      1. List candidate directories matching ^[0-9]{12}$ under crash_root.
-      2. Pick the latest lexicographically (correct for this timestamp
-         format).
-      3. Read dmesg.<timestamp> (fallback: first file starting with
-         dmesg.).
-      4. Run lightweight heuristic analysis (_analyze_dmesg_text_light).
-      5. Convert UTC timestamp to IST (+05:30) for convenience.
+    WHEN TO USE: User says "analyze crash", "check crash logs",
+    "what caused the crash", or after a VM panic/reboot when
+    /var/crash has crash dumps.
 
-    Returns fields:
-      - crash_dir, timestamp_utc, timestamp_ist
-      - dmesg_path, retrieved_bytes, truncated (bool)
-      - analysis (nested dict: event_type, short_summary, ...)
-      - raw_excerpt (tail ~40 lines)
-      - stdout/stderr/exit_code from retrieval (for debugging) if error
+    Looks for directories named YYYYMMDDHHMM (12-digit UTC timestamp)
+    under crash_root, picks the latest, reads its dmesg file, and runs
+    heuristic analysis (panic, null_deref, oops detection).
 
-    LLM finally gives a crisp and short analysis of the crash, steps to
-    mitigate, update in patch if possible or needed.
+    After reviewing results, provide a SHORT crash analysis with root
+    cause and mitigation steps.
+
+    Args:
+      connection_id: Active connection UUID.
+      crash_root: Directory containing crash subdirectories (default: /var/crash).
+      sudo_password: For reading crash files that require elevated permissions.
+      max_bytes: Max bytes to read from the dmesg file (default 500KB).
+      timeout_seconds: Max seconds per remote command.
+
+    Returns:
+      crash_dir, timestamp_utc, timestamp_ist, dmesg_path,
+      retrieved_bytes, truncated (bool),
+      analysis (dict with event_type, short_summary, suspected_function,
+        call_trace, recommended_actions),
+      raw_excerpt (last 40 lines of dmesg).
     """
-    client = connection_manager.get_connection(connection_id)
-    if client is None:
-        return {"error": "Unknown connection_id", "type": "NotFound"}
+    client, err = _client_or_error(connection_id)
+    if err:
+        return err
     return crash_analysis.analyze_latest_crash_dmesg_impl(
-        client, crash_root, sudo_password, max_bytes, timeout_seconds
+        client, crash_root, sudo_password, max_bytes, timeout_seconds,
     )
 
 
 @mcp.tool()
 def get_ethtool_stats(
     connection_id: str,
-    interface: str | None = None,
-    command: str | None = None,
+    interface: Optional[str] = None,
+    command: Optional[str] = None,
     timeout_seconds: int = 20,
 ) -> dict:
-    """Get Ethtool stats for MANA NIC
-    Run ethtool statistics (default: `ethtool -S <iface>`) or a custom
-    command and apply a quick panic heuristic.
+    """Get NIC statistics via ethtool or run a custom NIC diagnostic command.
 
-    Updated behavior:
-        - Primary intent is to fetch NIC statistics via `ethtool -S`
-          (was previously using other ethtool subcommands).
-        - If 'command' is supplied, it is executed verbatim (via bash -lc)
-          instead of the stats command.
-        - If no 'command' and an 'interface' is provided: run
-          `ethtool -S <interface>`.
-        - If neither 'command' nor 'interface' is given: default interface
-          'enP30832s1' is used.
+    WHEN TO USE: User says "ethtool stats", "NIC statistics",
+    "network stats", "check NIC", or needs to diagnose network issues.
 
-    Panic heuristic (unchanged, coarse):
-        - SSH exec exceptions (SSHException/EOFError/OSError/socket.error)
-          => panic=True
-        - Exceptions while reading stdout/stderr or retrieving exit status
-          => panic=True
-        - Transport becomes inactive after command with no exit_code
-          => panic=True
+    If neither command nor interface is provided, the default NIC is
+    auto-detected via ``ip route``.
 
-    Returns dict:
-        {
-            panic, panic_reason, exit_code, stdout, stderr, duration_ms,
-            executed_command, interface, transport_active_after
-        }
-    If panic occurs, LLM should run command for check ssh connection,
-    close ssh, ssh_connect, analyze_latest_crash_dmesg. It should not
-    rerun this same command without user asking.
+    PANIC HEURISTIC: If the SSH transport dies during execution,
+    panic=True is returned. On panic, follow this recovery sequence:
+      1. check_connection  (verify if VM is reachable)
+      2. ssh_close         (clean up dead session)
+      3. ssh_connect       (reconnect)
+      4. analyze_latest_crash_dmesg  (check what happened)
+    Do NOT re-run this tool on panic without the user asking.
+
+    Args:
+      connection_id: Active connection UUID.
+      interface: NIC interface name (e.g. "eth0"). Auto-detected if omitted.
+      command: Custom command to run instead of ethtool -S.
+      timeout_seconds: Max seconds.
+
+    Returns:
+      panic (bool), panic_reason (str|null), exit_code,
+      stdout, stderr, duration_ms, executed_command, interface,
+      transport_active_after (bool).
     """
-    client = connection_manager.get_connection(connection_id)
-    if client is None:
-        return {"error": "Unknown connection_id", "type": "NotFound"}
+    client, err = _client_or_error(connection_id)
+    if err:
+        return err
     return diagnostics.get_ethtool_stats_impl(
-        client, interface, command, timeout_seconds
+        client, interface, command, timeout_seconds,
     )
 
 
@@ -434,30 +568,40 @@ def reboot_vm(
 ) -> dict:
     """Initiate an asynchronous reboot of the remote VM.
 
-    Behavior:
-    - Uses an existing SSH connection (required).
-    - Spawns a background `nohup` shell that sleeps briefly, then runs
-      reboot.
-    - Returns immediately before the SSH session is terminated by the
-      reboot.
-    - If `sudo_password` is provided, uses it via `echo <pw> | sudo -S`.
-    - If `force` is True, uses `reboot -f` (force immediate reboot).
-    - `delay_seconds` lets the background shell finish writing response
-      before network drop.
+    WHEN TO USE: User says "reboot", "restart VM", or after a
+    successful build_kernel_from_source to boot into the new kernel.
 
-    Notes:
-    - After a successful response, the VM will go down shortly; further
-      commands on the same connection will fail.
-    - This tool does not verify that the VM came back up; that must be
-      done separately by attempting a new ssh_connect later.
+    The reboot is fire-and-forget: this tool returns BEFORE the VM
+    goes down.  The current connection_id will become invalid.
+    To reconnect after reboot, wait ~60 seconds then call ssh_connect.
+
+    Args:
+      connection_id: Active connection UUID.
+      sudo_password: For sudo reboot (required on non-root accounts).
+      force: If True, use ``reboot -f`` (immediate, no graceful shutdown).
+      delay_seconds: Seconds to sleep before issuing reboot (default 1).
+
+    Returns:
+      started (bool), stdout, stderr, command, force, delay_seconds.
     """
-    client = connection_manager.get_connection(connection_id)
-    if client is None:
-        return {"error": "Unknown connection_id", "type": "NotFound"}
-    return diagnostics.reboot_vm_impl(
-        client, sudo_password, force, delay_seconds
+    client, err = _client_or_error(connection_id)
+    if err:
+        return err
+    result = diagnostics.reboot_vm_impl(
+        client, sudo_password, force, delay_seconds,
     )
+    # The connection is guaranteed dead after reboot — remove it now
+    # so it doesn't linger as a stale entry in ssh_list.
+    if result.get("started"):
+        connection_manager.ssh_close_impl(connection_id)
+        result["connection_closed"] = True
+    return result
 
 
 if __name__ == "__main__":
-    mcp.run()
+    # For direct script execution, add the package parent to sys.path
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from mcp_ssh_server.ssh_server import mcp as _mcp
+    _mcp.run()

@@ -1,9 +1,37 @@
-"""Kernel development and build tools."""
-import time
-import shlex
+"""Kernel development and build tools.
+
+Provides implementations for:
+- Installing developer packages on the remote VM.
+- Building and installing a Linux kernel from source.
+- Automated git-bisect to locate compilation regressions.
+
+All functions accept a live ``paramiko.SSHClient`` and return a
+plain dict (never raise).  Shell commands use ``shlex.quote`` for
+all user-supplied values to prevent injection.
+"""
+
+from __future__ import annotations
+
 import re
+import shlex
 from typing import Optional
+
 import paramiko  # type: ignore[import-untyped]
+
+from ._helpers import (
+    run_ssh,
+    remote_path,
+    build_sudo_runner_snippet,
+    sudo_wrap,
+    error_result,
+    get_logger,
+    DEV_PACKAGES,
+    KERNEL_CONFIG_DISABLES,
+    KERNEL_CONFIG_UNDEFINES,
+    DEFAULT_REPO_PATH,
+)
+
+_log = get_logger("mcp_ssh_server.kernel_tools")
 
 
 def install_developer_tools_impl(
@@ -11,40 +39,32 @@ def install_developer_tools_impl(
     sudo_password: Optional[str] = None,
     timeout_seconds: int = 120,
 ) -> dict:
-    """Install basic developer tools on the remote VM."""
-    try:
-        if sudo_password:
-            cmd = (
-                f"echo {sudo_password} | sudo -S apt update && "
-                f"echo {sudo_password} | sudo -S apt install -y "
-                f"build-essential libncurses-dev bison flex "
-                f"libssl-dev libelf-dev ssh git vim net-tools "
-                f"zstd universal-ctags"
-            )
-        else:
-            cmd = (
-                "sudo apt update && "
-                "sudo apt install -y build-essential libncurses-dev "
-                "bison flex libssl-dev libelf-dev ssh git vim "
-                "net-tools zstd universal-ctags libdw-dev"
-            )
-        start = time.time()
-        stdin, stdout, stderr = client.exec_command(
-            cmd, timeout=timeout_seconds
+    """Install basic developer tools on the remote VM.
+
+    Uses the canonical ``DEV_PACKAGES`` list from ``_helpers`` so
+    both sudo and non-sudo branches install exactly the same set.
+    """
+    pkg_str = " ".join(DEV_PACKAGES)
+    update_cmd = "apt update"
+    install_cmd = f"apt install -y {pkg_str}"
+
+    if sudo_password:
+        pw = shlex.quote(sudo_password)
+        cmd = (
+            f"echo {pw} | sudo -S {update_cmd} && "
+            f"echo {pw} | sudo -S {install_cmd}"
         )
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-        exit_status = stdout.channel.recv_exit_status()
-        duration_ms = int((time.time()-start)*1000)
-        return {
-            "stdout": out,
-            "stderr": err,
-            "exit_code": exit_status,
-            "duration_ms": duration_ms,
-            "command": cmd
-        }
-    except Exception as e:
-        return {"error": str(e), "type": e.__class__.__name__}
+    else:
+        cmd = f"sudo {update_cmd} && sudo {install_cmd}"
+
+    code, out, err, dur = run_ssh(client, cmd, timeout=timeout_seconds)
+    return {
+        "stdout": out,
+        "stderr": err,
+        "exit_code": code,
+        "duration_ms": dur,
+        "command": cmd,
+    }
 
 
 def build_kernel_from_source_impl(
@@ -55,16 +75,34 @@ def build_kernel_from_source_impl(
     jobs: int = 0,
     timeout_seconds: int = 7200,
 ) -> dict:
-    """Build and install the kernel from the repo root (no reboot)."""
+    """Build and install the kernel from the repo root (no reboot).
+
+    Uses ``_helpers.build_sudo_runner_snippet`` for safe sudo
+    handling and ``KERNEL_CONFIG_DISABLES`` / ``KERNEL_CONFIG_UNDEFINES``
+    for reproducible .config sanitisation.
+    """
     jobs_flag = f"-j{jobs}" if jobs and jobs > 0 else "-j$(nproc)"
-    pw = sudo_password or ""
+    rpath = remote_path(repo_path)
+
+    # Build disable lines from centralised lists
+    disable_lines = "\n".join(
+        f"      scripts/config --disable {opt} || true"
+        for opt in KERNEL_CONFIG_DISABLES
+    )
+    undefine_lines = "\n".join(
+        f"      scripts/config --undefine {opt} || true"
+        for opt in KERNEL_CONFIG_UNDEFINES
+    )
+
+    sudo_snippet = build_sudo_runner_snippet(sudo_password)
+
     script = f"""
     set -euo pipefail
     LOG=/tmp/simple_kernel_build_$(date +%s).log
     exec > >(tee -a "$LOG") 2>&1
 
     echo "[info] repo: {repo_path}"
-    cd {repo_path}
+    cd {rpath}
     git rev-parse --is-inside-work-tree >/dev/null
 
     echo "[step] copy base config"
@@ -76,25 +114,14 @@ def build_kernel_from_source_impl(
 
     if [ -x scripts/config ]; then
       echo "[step] disabling keys & module signing"
-      scripts/config --disable SYSTEM_TRUSTED_KEYS || true
-      scripts/config --disable SYSTEM_REVOCATION_KEYS || true
-      scripts/config --disable MODULE_SIG || true
-      scripts/config --disable MODULE_SIG_ALL || true
-      scripts/config --disable MODULE_SIG_SHA512 || true
-      scripts/config --undefine MODULE_SIG_KEY || true
+{disable_lines}
+{undefine_lines}
     fi
 
     echo "[step] second olddefconfig"
     make olddefconfig
 
-    SUDO_PW={shlex.quote(pw)}
-    run_sudo() {{
-        if [ -n "$SUDO_PW" ]; then
-            echo "$SUDO_PW" | sudo -S bash -lc "$1"
-        else
-            sudo bash -lc "$1"
-        fi
-    }}
+    {sudo_snippet}
 
     echo "[build] kernel {jobs_flag}"
     run_sudo "make {jobs_flag}"
@@ -113,79 +140,67 @@ def build_kernel_from_source_impl(
     echo "[done] kernelrelease=$KREL"
     echo "$LOG"
     """
-    try:
-        cmd = f"bash -lc {shlex.quote(script)}"
-        start = time.time()
-        stdin, stdout, stderr = client.exec_command(
-            cmd, timeout=timeout_seconds
-        )
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-        code = stdout.channel.recv_exit_status()
-        duration_ms = int((time.time() - start) * 1000)
-        log_path = None
-        for line in reversed(out.strip().splitlines()):
-            if line.startswith("/tmp/simple_kernel_build_"):
-                log_path = line.strip()
-                break
-        kernelrelease = None
-        for line in reversed(out.strip().splitlines()):
-            if line.startswith("[done] kernelrelease="):
-                kernelrelease = line.split("=", 1)[1]
-                break
-        return {
-            "exit_code": code,
-            "duration_ms": duration_ms,
-            "stdout": out,
-            "stderr": err,
-            "repo_path": repo_path,
-            "log_path": log_path,
-            "kernelrelease": kernelrelease,
-        }
-    except Exception as e:
-        return {"error": str(e), "type": e.__class__.__name__}
+    cmd = f"bash -lc {shlex.quote(script)}"
+    code, out, err, dur = run_ssh(client, cmd, timeout=timeout_seconds)
+
+    log_path = None
+    kernelrelease = None
+    for line in reversed(out.strip().splitlines()):
+        if line.startswith("/tmp/simple_kernel_build_") and log_path is None:
+            log_path = line.strip()
+        if line.startswith("[done] kernelrelease=") and kernelrelease is None:
+            kernelrelease = line.split("=", 1)[1]
+
+    return {
+        "exit_code": code,
+        "duration_ms": dur,
+        "stdout": out,
+        "stderr": err,
+        "repo_path": repo_path,
+        "log_path": log_path,
+        "kernelrelease": kernelrelease,
+    }
 
 
 def test_kernel_compile(
     client: paramiko.SSHClient,
     repo_path: str,
-    sudo_password: str = ""
+    sudo_password: str = "",
 ) -> bool:
-    """Internal helper to test kernel compilation at current commit."""
-    pw = sudo_password
+    """Internal helper: test kernel compilation at current commit.
+
+    Returns ``True`` only when exit-code is 0 **and** stdout+stderr
+    contain none of the known fatal error markers.
+    """
+    rpath = remote_path(repo_path)
+    sudo_snippet = build_sudo_runner_snippet(sudo_password or None)
+
     script = f"""
     set -euo pipefail
-    cd {repo_path}
+    cd {rpath}
 
-    # Ensure a consistent base config, then update defaults
     if [ ! -f .config ]; then
         cp /boot/config-$(uname -r) .config || true
     fi
     make olddefconfig
 
-    # Run compilation
-    SUDO_PW={shlex.quote(pw)}
-    if [ -n "$SUDO_PW" ]; then
-        echo "$SUDO_PW" | sudo -S make -j$(nproc)
-    else
-        sudo make -j$(nproc)
-    fi
+    {sudo_snippet}
+    run_sudo "make -j$(nproc)"
     """
-
-    try:
-        stdin, stdout, stderr = client.exec_command(
-            f"bash -c {shlex.quote(script)}", timeout=1800
-        )
-        out = stdout.read().decode('utf-8', errors='replace')
-        err = stderr.read().decode('utf-8', errors='replace')
-        exit_code = stdout.channel.recv_exit_status()
-
-        return exit_code == 0 and not any(x in (out + err).lower() for x in [
-            "error:", "failed", "fatal error", "compilation terminated",
-            "make: *** [", "no rule to make target"
-        ])
-    except Exception:
+    code, out, err, _ = run_ssh(
+        client, f"bash -c {shlex.quote(script)}", timeout=1800,
+    )
+    if code != 0:
         return False
+    combined = (out + err).lower()
+    return not any(
+        marker in combined
+        for marker in (
+            "error:", "failed", "fatal error",
+            "compilation terminated",
+            "make: *** [", "no rule to make target",
+        )
+    )
 
 
 def find_compile_regression_impl(
@@ -193,72 +208,81 @@ def find_compile_regression_impl(
     good_commit: str = "v6.8",
     bad_commit: str = "HEAD",
     repo_path: str = "~/repos/net-next",
-    sudo_password: str = ""
+    sudo_password: str = "",
 ) -> dict:
-    """Automated git bisect to find compilation regression."""
-    def run_cmd(cmd):
-        try:
-            stdin, stdout, stderr = client.exec_command(
-                f"cd {repo_path}; {cmd}", timeout=60
-            )
-            out = stdout.read().decode('utf-8', errors='replace')
-            err = stderr.read().decode('utf-8', errors='replace')
-            return out + err
-        except Exception as e:
-            return f"Error: {e}"
+    """Automated git bisect to find compilation regression.
+
+    Uses binary search between *good_commit* and *bad_commit*,
+    testing compilation at each step.  Returns the culprit commit
+    hash and a step-by-step log.
+    """
+    rpath = remote_path(repo_path)
+
+    def run_cmd(cmd: str) -> str:
+        full_cmd = f"cd {rpath}; {cmd}"
+        code, out, err, _ = run_ssh(
+            client, f"bash -lc {shlex.quote(full_cmd)}", timeout=60,
+        )
+        return out + err
 
     steps: list[dict] = []
-    culprit = None
+    culprit: Optional[str] = None
 
     try:
         run_cmd("git bisect reset")
         run_cmd("git bisect start")
-        run_cmd(f"git bisect bad {bad_commit}")
-        run_cmd(f"git bisect good {good_commit}")
+        run_cmd(f"git bisect bad {shlex.quote(bad_commit)}")
+        run_cmd(f"git bisect good {shlex.quote(good_commit)}")
 
         while len(steps) < 20:
             current = run_cmd("git rev-parse HEAD").strip()
             if not current or len(current) < 8:
                 break
 
-            msg = run_cmd(f"git log -1 --format='%s' {current}").strip()
-            compile_ok = test_kernel_compile(client, repo_path, sudo_password)
+            msg = run_cmd(
+                f"git log -1 --format='%s' {current}"
+            ).strip()
+            compile_ok = test_kernel_compile(
+                client, repo_path, sudo_password,
+            )
 
             steps.append({
                 "commit": current[:8],
-                "message": msg[:50] + "..." if len(msg) > 50 else msg,
-                "result": "PASS" if compile_ok else "FAIL"
+                "message": (
+                    msg[:50] + "..." if len(msg) > 50 else msg
+                ),
+                "result": "PASS" if compile_ok else "FAIL",
             })
 
-            bisect_cmd = "git bisect good" if compile_ok else "git bisect bad"
+            bisect_cmd = (
+                "git bisect good" if compile_ok else "git bisect bad"
+            )
             bisect_result = run_cmd(bisect_cmd)
 
             if "is the first bad commit" in bisect_result:
                 m = re.search(
                     r"([0-9a-f]{7,40})\s+is the first bad commit",
-                    bisect_result
+                    bisect_result,
                 )
-                if m:
-                    culprit = m.group(1)
-                else:
-                    # Fallback: ask git for the current commit
-                    culprit = run_cmd("git rev-parse HEAD").strip()
+                culprit = (
+                    m.group(1) if m
+                    else run_cmd("git rev-parse HEAD").strip()
+                )
                 break
-            elif ("There are only" in bisect_result and
-                  "revisions left" in bisect_result):
+            elif (
+                "There are only" in bisect_result
+                and "revisions left" in bisect_result
+            ):
                 continue
-            # elif not any(
-            #     word in bisect_result.lower()
-            #     for word in ["bisecting:", "checkout"]
-            # ):
-            #     break
 
         run_cmd("git bisect reset")
 
         return {
             "success": True,
-            "culprit_commit": culprit[:8] if culprit else "Not found",
-            "culprit_full": culprit if culprit else None,
+            "culprit_commit": (
+                culprit[:8] if culprit else "Not found"
+            ),
+            "culprit_full": culprit,
             "steps_taken": len(steps),
             "bisect_log": steps,
             "summary": (
@@ -267,9 +291,9 @@ def find_compile_regression_impl(
                 f"after {len(steps)} compilation tests"
             ),
             "repo_path": repo_path,
-            "commit_range": f"{good_commit}..{bad_commit}"
+            "commit_range": f"{good_commit}..{bad_commit}",
         }
 
-    except Exception as e:
+    except Exception as exc:
         run_cmd("git bisect reset")
-        return {"error": str(e), "success": False}
+        return error_result(str(exc), exc.__class__.__name__, success=False)

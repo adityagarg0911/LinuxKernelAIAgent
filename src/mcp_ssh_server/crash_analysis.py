@@ -1,9 +1,31 @@
-"""Crash analysis and dmesg parsing tools."""
+"""Crash analysis and dmesg parsing tools.
+
+Provides two main entry points:
+- ``analyze_dmesg_tail_impl`` — fetch the tail of the live dmesg ring
+  buffer and run heuristic matching.
+- ``analyze_latest_crash_dmesg_impl`` — locate the most recent crash
+  directory under ``/var/crash`` and analyze its saved dmesg file.
+
+The lightweight heuristic analyser (``analyze_dmesg_text_light``) is
+also available for reuse by other modules.
+"""
+
+from __future__ import annotations
+
 import re
 import shlex
 from datetime import datetime, timedelta
 from typing import Optional
+
 import paramiko  # type: ignore[import-untyped]
+
+from ._helpers import (
+    run_ssh,
+    sudo_wrap,
+    error_result,
+    get_logger,
+    DEFAULT_CRASH_ROOT,
+)
 
 
 def analyze_dmesg_text_light(raw: str) -> dict:
@@ -116,30 +138,15 @@ def analyze_dmesg_tail_impl(
 ) -> dict:
     """Fetch and heuristically analyze the tail of dmesg."""
     if lines <= 0:
-        return {"error": "lines must be > 0", "type": "ValueError"}
+        return error_result("lines must be > 0", "ValueError")
 
     base_cmd = f"dmesg | tail -n {int(lines)}"
-    if sudo_password:
-        full_cmd = (
-            f"echo {shlex.quote(sudo_password)} | sudo -S bash -lc "
-            f"{shlex.quote(base_cmd)}"
-        )
-    else:
-        full_cmd = f"sudo bash -lc {shlex.quote(base_cmd)}"
+    full_cmd = sudo_wrap(base_cmd, sudo_password)
     used_sudo = True
-    try:
-        stdin, stdout, stderr = client.exec_command(
-            full_cmd, timeout=timeout_seconds
-        )
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-        exit_code = stdout.channel.recv_exit_status()
-    except Exception as e:
-        return {
-            "error": str(e),
-            "type": e.__class__.__name__,
-            "used_sudo": used_sudo,
-        }
+
+    code, out, err, _ = run_ssh(client, full_cmd, timeout=timeout_seconds)
+    if code == -1:
+        return error_result(err, "SSHException", used_sudo=used_sudo)
 
     lines_list = out.splitlines()
     indicators = {
@@ -181,7 +188,7 @@ def analyze_dmesg_tail_impl(
     return {
         "stdout": out,
         "stderr": err,
-        "exit_code": exit_code,
+        "exit_code": code,
         "lines_requested": lines,
         "lines_returned": len(lines_list),
         "issues_detected": issues_detected,
@@ -195,7 +202,7 @@ def analyze_dmesg_tail_impl(
 
 def analyze_latest_crash_dmesg_impl(
     client: paramiko.SSHClient,
-    crash_root: str = "/var/crash",
+    crash_root: str = DEFAULT_CRASH_ROOT,
     sudo_password: Optional[str] = None,
     max_bytes: int = 500_000,
     timeout_seconds: int = 20,
@@ -205,15 +212,11 @@ def analyze_latest_crash_dmesg_impl(
         f"bash -lc 'ls -1 {shlex.quote(crash_root)} 2>/dev/null | "
         f"grep -E " + "'^[0-9]{12}$'" + " | sort'"
     )
-    try:
-        stdin, stdout, stderr = client.exec_command(
-            list_cmd, timeout=timeout_seconds
-        )
-        dirs_out = stdout.read().decode("utf-8", errors="replace")
-        dirs_err = stderr.read().decode("utf-8", errors="replace")
-        _ = stdout.channel.recv_exit_status()
-    except Exception as e:
-        return {"error": str(e), "type": e.__class__.__name__, "stage": "list"}
+    code, dirs_out, dirs_err, _ = run_ssh(
+        client, list_cmd, timeout=timeout_seconds,
+    )
+    if code == -1:
+        return error_result(dirs_err, "SSHException", stage="list")
 
     candidates = [d.strip() for d in dirs_out.splitlines() if d.strip()]
     candidates = [d for d in candidates if len(d) == 12 and d.isdigit()]
@@ -238,66 +241,46 @@ def analyze_latest_crash_dmesg_impl(
         ts_ist_iso = None
 
     dmesg_path = f"{crash_root}/{latest}/dmesg.{latest}"
-    if sudo_password:
-        cat_cmd = (
-            f"echo {shlex.quote(sudo_password)} | sudo -S bash -lc "
-            f"'cat {shlex.quote(dmesg_path)}'"
-        )
-    else:
-        cat_cmd = f"bash -lc 'cat {shlex.quote(dmesg_path)}'"
+    cat_cmd = sudo_wrap(
+        f"cat {shlex.quote(dmesg_path)}", sudo_password,
+    )
 
-    try:
-        stdin, stdout, stderr = client.exec_command(
-            cat_cmd, timeout=timeout_seconds
-        )
-        raw_bytes = stdout.read()[:max_bytes+1]
-        err_text = stderr.read().decode("utf-8", errors="replace")
-        exit_code = stdout.channel.recv_exit_status()
-        if exit_code != 0 or not raw_bytes:
-            list_dmesg_cmd = (
-                f"bash -lc 'ls -1 {shlex.quote(crash_root)}/{latest} "
-                f"2>/dev/null | grep ^dmesg'"
-            )
-            if sudo_password:
-                list_dmesg_cmd = (
-                    f"echo {shlex.quote(sudo_password)} | sudo -S "
-                    f"{list_dmesg_cmd}"
-                )
-            stdin2, stdout2, stderr2 = client.exec_command(
-                list_dmesg_cmd, timeout=timeout_seconds
-            )
-            files_list = stdout2.read().decode(
-                "utf-8", errors="replace"
-            ).splitlines()
-            err2 = stderr2.read().decode("utf-8", errors="replace")
-            alt = files_list[0].strip() if files_list else None
-            if alt:
-                dmesg_path = f"{crash_root}/{latest}/{alt}"
-                if sudo_password:
-                    cat_cmd = (
-                        f"echo {shlex.quote(sudo_password)} | "
-                        f"sudo -S bash -lc 'cat {shlex.quote(dmesg_path)}'"
-                    )
-                else:
-                    cat_cmd = f"bash -lc 'cat {shlex.quote(dmesg_path)}'"
-                stdin3, stdout3, stderr3 = client.exec_command(
-                    cat_cmd, timeout=timeout_seconds
-                )
-                raw_bytes = stdout3.read()[:max_bytes+1]
-                err_text = stderr3.read().decode("utf-8", errors="replace")
-                exit_code = stdout3.channel.recv_exit_status()
-            else:
-                return {
-                    "error": "dmesg file not found in crash dir",
-                    "type": "NotFound",
-                    "crash_dir": latest,
-                    "stderr": err_text + "\n" + err2,
-                }
-    except Exception as e:
-        return {"error": str(e), "type": e.__class__.__name__, "stage": "read"}
+    code, raw_out, err_text, _ = run_ssh(
+        client, cat_cmd, timeout=timeout_seconds,
+    )
 
-    raw = raw_bytes.decode("utf-8", errors="replace")
-    truncated = len(raw_bytes) > max_bytes
+    if code != 0 or not raw_out:
+        # Fallback: list dmesg.* files and try the first one
+        list_dmesg_cmd = (
+            f"bash -lc 'ls -1 {shlex.quote(crash_root)}/{latest} "
+            f"2>/dev/null | grep ^dmesg'"
+        )
+        if sudo_password:
+            list_dmesg_cmd = sudo_wrap(list_dmesg_cmd, sudo_password)
+
+        _, ls_out, err2, _ = run_ssh(
+            client, list_dmesg_cmd, timeout=timeout_seconds,
+        )
+        files_list = ls_out.splitlines()
+        alt = files_list[0].strip() if files_list else None
+        if alt:
+            dmesg_path = f"{crash_root}/{latest}/{alt}"
+            cat_cmd = sudo_wrap(
+                f"cat {shlex.quote(dmesg_path)}", sudo_password,
+            )
+            code, raw_out, err_text, _ = run_ssh(
+                client, cat_cmd, timeout=timeout_seconds,
+            )
+        else:
+            return error_result(
+                "dmesg file not found in crash dir",
+                "NotFound",
+                crash_dir=latest,
+                stderr=err_text + "\n" + err2,
+            )
+
+    truncated = len(raw_out) > max_bytes
+    raw = raw_out[:max_bytes] if truncated else raw_out
     analysis = analyze_dmesg_text_light(raw)
     excerpt = "\n".join(raw.splitlines()[-40:])
 
