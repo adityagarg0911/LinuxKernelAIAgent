@@ -1,10 +1,24 @@
-"""Diagnostic tools for SSH connections, kernel version, ethtool, reboot."""
-import socket
+"""Diagnostic tools for SSH connections, kernel version, ethtool, reboot.
+
+All public ``_impl`` functions accept a live ``paramiko.SSHClient``
+and return a plain dict (never raise).
+"""
+
+from __future__ import annotations
+
 import shlex
+import socket
 import time
-from typing import Optional, Literal
+from typing import Literal, Optional
+
 import paramiko  # type: ignore[import-untyped]
 
+from ._helpers import run_ssh, sudo_wrap, error_result, get_logger
+
+_log = get_logger("mcp_ssh_server.diagnostics")
+
+
+# ── ssh_exec ──────────────────────────────────────────────────────
 
 def ssh_exec_impl(
     client: paramiko.SSHClient,
@@ -13,24 +27,20 @@ def ssh_exec_impl(
     output_encoding: Literal["utf-8", "latin-1"] = "utf-8",
 ) -> dict:
     """Execute any shell command over SSH."""
-    try:
-        start = time.time()
-        stdin, stdout, stderr = client.exec_command(
-            command, timeout=timeout_seconds
-        )
-        out = stdout.read().decode(output_encoding, errors="replace")
-        err = stderr.read().decode(output_encoding, errors="replace")
-        exit_status = stdout.channel.recv_exit_status()
-        duration_ms = int((time.time()-start)*1000)
-        return {
-            "stdout": out,
-            "stderr": err,
-            "exit_code": exit_status,
-            "duration_ms": duration_ms
-        }
-    except Exception as e:
-        return {"error": str(e), "type": e.__class__.__name__}
+    code, out, err, dur = run_ssh(
+        client, command, timeout=timeout_seconds, encoding=output_encoding,
+    )
+    if code == -1:
+        return error_result(err, "SSHException", duration_ms=dur)
+    return {
+        "stdout": out,
+        "stderr": err,
+        "exit_code": code,
+        "duration_ms": dur,
+    }
 
+
+# ── check_connection ─────────────────────────────────────────────
 
 def check_connection_impl(
     client: paramiko.SSHClient,
@@ -40,99 +50,99 @@ def check_connection_impl(
     try:
         transport = client.get_transport()
         transport_active = bool(transport and transport.is_active())
-    except Exception as e:
+    except Exception as exc:
         return {
             "alive": False,
             "transport_active": False,
             "latency_ms": None,
             "reason": "transport-check-exception",
-            "error": str(e),
-            "type": e.__class__.__name__,
+            "error": str(exc),
+            "type": exc.__class__.__name__,
         }
 
-    cmd = "bash -lc 'echo OK'"
-    start = time.time()
-    try:
-        stdin, stdout, stderr = client.exec_command(
-            cmd, timeout=timeout_seconds
-        )
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-        exit_code = stdout.channel.recv_exit_status()
-        latency_ms = int((time.time() - start) * 1000)
-        ok = (exit_code == 0) and ("OK" in out)
-        alive = ok and transport_active
-        reason = None
-        if not alive:
-            if not transport_active:
-                reason = "transport-inactive"
-            elif not ok:
-                reason = "exec-failed"
-        return {
-            "alive": alive,
-            "transport_active": transport_active,
-            "latency_ms": latency_ms,
-            "stdout": out,
-            "stderr": err,
-            "exit_code": exit_code,
-            "reason": reason,
-        }
-    except Exception as e:
-        return {
-            "alive": False,
-            "transport_active": transport_active,
-            "latency_ms": None,
-            "reason": "exec-exception",
-            "error": str(e),
-            "type": e.__class__.__name__,
-        }
+    code, out, err, latency_ms = run_ssh(
+        client, "bash -lc 'echo OK'", timeout=timeout_seconds,
+    )
 
+    ok = (code == 0) and ("OK" in out)
+    alive = ok and transport_active
+    reason = None
+    if not alive:
+        if not transport_active:
+            reason = "transport-inactive"
+        elif not ok:
+            reason = "exec-failed"
+    return {
+        "alive": alive,
+        "transport_active": transport_active,
+        "latency_ms": latency_ms,
+        "stdout": out,
+        "stderr": err,
+        "exit_code": code,
+        "reason": reason,
+    }
+
+
+# ── kernel_version ───────────────────────────────────────────────
 
 def kernel_version_impl(
     client: paramiko.SSHClient,
     timeout_seconds: int = 5,
 ) -> dict:
-    """Retrieve the remote kernel version using `uname -rs`."""
-    try:
-        stdin, stdout, stderr = client.exec_command(
-            "uname -rs", timeout=timeout_seconds
-        )
-        out = stdout.read().decode("utf-8", errors="replace").strip()
-        err = stderr.read().decode("utf-8", errors="replace").strip()
-        exit_status = stdout.channel.recv_exit_status()
-        kernel_name = None
-        release = None
-        if out:
-            parts = out.split()
-            if len(parts) >= 2:
-                kernel_name, release = parts[0], parts[1]
-        return {
-            "stdout": out,
-            "stderr": err,
-            "exit_code": exit_status,
-            "kernel_name": kernel_name,
-            "release": release,
-        }
-    except Exception as e:
-        return {"error": str(e), "type": e.__class__.__name__}
+    """Retrieve the remote kernel version using ``uname -rs``."""
+    code, out, err, _ = run_ssh(
+        client, "uname -rs", timeout=timeout_seconds,
+    )
+    out = out.strip()
+    err = err.strip()
+    kernel_name = release = None
+    if out:
+        parts = out.split()
+        if len(parts) >= 2:
+            kernel_name, release = parts[0], parts[1]
+    return {
+        "stdout": out,
+        "stderr": err,
+        "exit_code": code,
+        "kernel_name": kernel_name,
+        "release": release,
+    }
+
+
+# ── ethtool stats ────────────────────────────────────────────────
+
+def _detect_default_interface(client: paramiko.SSHClient) -> str:
+    """Best-effort auto-detect of the default NIC interface name.
+
+    Falls back to ``eth0`` if detection fails.
+    """
+    code, out, _, _ = run_ssh(
+        client,
+        "bash -lc \"ip -o route get 8.8.8.8 2>/dev/null "
+        "| awk '{print $5; exit}'\"",
+        timeout=5,
+    )
+    iface = out.strip()
+    if code == 0 and iface and " " not in iface:
+        return iface
+    return "eth0"
 
 
 def get_ethtool_stats_impl(
     client: paramiko.SSHClient,
-    interface: str | None = None,
-    command: str | None = None,
+    interface: Optional[str] = None,
+    command: Optional[str] = None,
     timeout_seconds: int = 20,
 ) -> dict:
-    """Get ethtool stats for MANA NIC or run custom command."""
-    # Decide command preference order.
+    """Get ethtool stats or run a custom NIC command.
+
+    If neither *command* nor *interface* is given the default NIC
+    is auto-detected via ``ip route``.
+    """
     if command:
         base_cmd = command
     else:
-        # Ensure a concrete interface (default to the user's
-        # requested one if none provided)
-        iface = interface or "enP30832s1"
-        # ethtool -S provides per-NIC statistics; degrade
-        # gracefully if ethtool or iface absent.
+        iface = interface or _detect_default_interface(client)
         base_cmd = (
             f"(ethtool -S {shlex.quote(iface)}) || "
             f"echo 'ethtool not available or interface {iface} missing'"
@@ -152,9 +162,10 @@ def get_ethtool_stats_impl(
     exit_code = None
     panic = False
     panic_reason = None
+
     try:
         stdin, stdout, stderr = client.exec_command(
-            full_cmd, timeout=timeout_seconds
+            full_cmd, timeout=timeout_seconds,
         )
         try:
             stdout_txt = stdout.read().decode("utf-8", errors="replace")
@@ -171,15 +182,11 @@ def get_ethtool_stats_impl(
                     f"status-exception:{st_err.__class__.__name__}"
                 )
     except (
-        paramiko.SSHException,
-        EOFError,
-        OSError,
-        socket.error,
+        paramiko.SSHException, EOFError, OSError, socket.error,
     ) as exec_err:
         panic = True
         panic_reason = f"exec-exception:{exec_err.__class__.__name__}"
-    except Exception as e:
-        # Unexpected local error (not necessarily panic)
+    except Exception as exc:
         duration_ms = int((time.time() - start) * 1000)
         try:
             after_active = bool(
@@ -197,8 +204,8 @@ def get_ethtool_stats_impl(
             "transport_active_after": after_active,
             "duration_ms": duration_ms,
             "executed_command": base_cmd,
-            "error": str(e),
-            "type": e.__class__.__name__,
+            "error": str(exc),
+            "type": exc.__class__.__name__,
         }
 
     try:
@@ -211,7 +218,7 @@ def get_ethtool_stats_impl(
     if (
         not panic
         and before_active
-        and (not after_active)
+        and not after_active
         and exit_code is None
     ):
         panic = True
@@ -231,6 +238,8 @@ def get_ethtool_stats_impl(
     }
 
 
+# ── reboot_vm ────────────────────────────────────────────────────
+
 def reboot_vm_impl(
     client: paramiko.SSHClient,
     sudo_password: Optional[str] = None,
@@ -241,7 +250,6 @@ def reboot_vm_impl(
     try:
         reboot_cmd = "reboot -f" if force else "reboot"
         if sudo_password:
-            # Use shlex.quote to reduce risk of shell interpretation issues.
             pw = shlex.quote(sudo_password)
             inner = (
                 f"sleep {int(delay_seconds)}; "
@@ -249,7 +257,6 @@ def reboot_vm_impl(
             )
         else:
             inner = f"sleep {int(delay_seconds)}; sudo {reboot_cmd}"
-        # Run in background so we can return before connection is severed.
         full_cmd = (
             f"nohup sh -c '{inner}' >/dev/null 2>&1 & echo REBOOTING"
         )
@@ -264,5 +271,5 @@ def reboot_vm_impl(
             "force": force,
             "delay_seconds": delay_seconds,
         }
-    except Exception as e:
-        return {"error": str(e), "type": e.__class__.__name__}
+    except Exception as exc:
+        return error_result(str(exc), exc.__class__.__name__)
