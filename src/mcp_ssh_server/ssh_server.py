@@ -23,7 +23,7 @@ from . import kernel_tools
 from . import crash_analysis
 from . import git_operations
 from . import diagnostics
-from ._helpers import not_found_result, DEFAULT_REPO_PATH, DEFAULT_PATCH_FILENAME
+from ._helpers import not_found_result
 
 mcp = FastMCP("SSH")
 
@@ -596,12 +596,3 @@ def reboot_vm(
         connection_manager.ssh_close_impl(connection_id)
         result["connection_closed"] = True
     return result
-
-
-if __name__ == "__main__":
-    # For direct script execution, add the package parent to sys.path
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from mcp_ssh_server.ssh_server import mcp as _mcp
-    _mcp.run()

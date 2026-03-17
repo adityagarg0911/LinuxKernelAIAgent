@@ -208,6 +208,7 @@ def analyze_latest_crash_dmesg_impl(
     timeout_seconds: int = 20,
 ) -> dict:
     """Locate the newest crash directory and analyze its dmesg file."""
+    max_bytes = max(1, int(max_bytes))
     list_cmd = (
         f"bash -lc 'ls -1 {shlex.quote(crash_root)} 2>/dev/null | "
         f"grep -E " + "'^[0-9]{12}$'" + " | sort'"
@@ -242,7 +243,7 @@ def analyze_latest_crash_dmesg_impl(
 
     dmesg_path = f"{crash_root}/{latest}/dmesg.{latest}"
     cat_cmd = sudo_wrap(
-        f"cat {shlex.quote(dmesg_path)}", sudo_password,
+        f"head -c {int(max_bytes) + 1} {shlex.quote(dmesg_path)}", sudo_password,
     )
 
     code, raw_out, err_text, _ = run_ssh(
@@ -266,7 +267,7 @@ def analyze_latest_crash_dmesg_impl(
         if alt:
             dmesg_path = f"{crash_root}/{latest}/{alt}"
             cat_cmd = sudo_wrap(
-                f"cat {shlex.quote(dmesg_path)}", sudo_password,
+                f"head -c {int(max_bytes) + 1} {shlex.quote(dmesg_path)}", sudo_password,
             )
             code, raw_out, err_text, _ = run_ssh(
                 client, cat_cmd, timeout=timeout_seconds,

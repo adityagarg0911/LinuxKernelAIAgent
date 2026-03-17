@@ -142,14 +142,14 @@ def run_ssh(
 def remote_path(path: str) -> str:
     """Convert a user-supplied path to a shell-safe remote path.
 
-    ``~/foo``       → ``${HOME}/foo``  (variable expansion)
-    ``$HOME/foo``   → ``${HOME}/foo``
+    ``~/foo``       → ``${HOME}/'foo'``  (variable expansion + quoted tail)
+    ``$HOME/foo``   → ``${HOME}/'foo'``
     ``/abs/path``   → ``'/abs/path'``  (shlex-quoted)
     """
     for prefix in ("~/", "$HOME/", "${HOME}/"):
         if path.startswith(prefix):
             tail = path[len(prefix):]
-            return f"${{HOME}}/{tail}"
+            return "${HOME}/" + shlex.quote(tail)
     if path == "~":
         return "${HOME}"
     return shlex.quote(path)

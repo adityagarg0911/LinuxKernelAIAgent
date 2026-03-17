@@ -257,8 +257,11 @@ def reboot_vm_impl(
             )
         else:
             inner = f"sleep {int(delay_seconds)}; sudo {reboot_cmd}"
+        # Outer redirection/backgrounding intentionally outside the quoted
+        # sh -c argument so nohup captures the subprocess I/O and `echo
+        # REBOOTING` runs immediately in the calling shell.
         full_cmd = (
-            f"nohup sh -c '{inner}' >/dev/null 2>&1 & echo REBOOTING"
+            f"nohup sh -c {shlex.quote(inner)} >/dev/null 2>&1 & echo REBOOTING"
         )
         stdin, stdout, stderr = client.exec_command(full_cmd, timeout=5)
         out = stdout.read().decode("utf-8", errors="replace").strip()
